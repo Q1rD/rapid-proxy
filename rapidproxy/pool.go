@@ -24,8 +24,6 @@ type Pool struct {
 	selector      *selector.RoundRobinSelector
 	workerPool    *worker.Pool
 	collector     *metrics.Collector
-	domainLimiter *ratelimit.DomainLimiter
-
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -50,6 +48,7 @@ func New(config *Config) (*Pool, error) {
 		TransportConfig: &connection.TransportConfig{
 			MaxIdleConns:          config.MaxIdleConns,
 			MaxIdleConnsPerHost:   config.MaxIdleConnsPerHost,
+			MaxConnsPerHost:       config.MaxConcurrentPerProxy,
 			IdleConnTimeout:       config.IdleConnTimeout,
 			DialTimeout:           config.DialTimeout,
 			TLSHandshakeTimeout:   config.TLSHandshakeTimeout,
@@ -92,10 +91,18 @@ func New(config *Config) (*Pool, error) {
 		client.SetCircuitBreaker(cb)
 	}
 
-	// 5.5. Create domain rate limiter (optional)
-	var domainLimiter *ratelimit.DomainLimiter
+	// 5.5. Set per-proxy concurrency semaphore (optional)
+	if config.MaxConcurrentPerProxy > 0 {
+		for _, client := range clients {
+			client.SetConcurrencySemaphore(config.MaxConcurrentPerProxy)
+		}
+	}
+
+	// 5.6. Set per-proxy domain rate limiters (optional)
 	if len(config.DomainRateLimits) > 0 {
-		domainLimiter = ratelimit.NewDomainLimiter(config.DomainRateLimits)
+		for _, client := range clients {
+			client.SetDomainLimiter(ratelimit.NewDomainLimiter(config.DomainRateLimits))
+		}
 	}
 
 	// 6. Create selector
@@ -125,9 +132,8 @@ func New(config *Config) (*Pool, error) {
 		manager:       manager,
 		selector:      sel,
 		workerPool:    wp,
-		collector:     collector,
-		domainLimiter: domainLimiter,
-		ctx:           ctx,
+		collector: collector,
+		ctx:       ctx,
 		cancel:        cancel,
 	}
 
@@ -144,14 +150,6 @@ func (p *Pool) Do(req *http.Request) (*Result, error) {
 
 // DoWithContext executes a request with context
 func (p *Pool) DoWithContext(ctx context.Context, req *http.Request) (*Result, error) {
-	// Check domain rate limit (if configured)
-	if p.domainLimiter != nil {
-		domain := req.URL.Hostname()
-		if err := p.domainLimiter.Acquire(ctx, domain); err != nil {
-			return nil, err
-		}
-	}
-
 	// Create job
 	job := worker.NewJob(req.Clone(ctx))
 
@@ -188,42 +186,11 @@ func (p *Pool) DoBatch(requests []*http.Request) ([]*Result, error) {
 func (p *Pool) DoBatchWithContext(ctx context.Context, requests []*http.Request) ([]*Result, error) {
 	results := make([]*Result, len(requests))
 
-	// Check domain rate limits and create jobs (in parallel for performance)
+	// Create and submit jobs
 	jobs := make([]worker.Job, len(requests))
-	var wgDomain sync.WaitGroup
-
 	for i, req := range requests {
-		wgDomain.Add(1)
-		go func(idx int, request *http.Request) {
-			defer wgDomain.Done()
-
-			// Check domain rate limit (if configured)
-			if p.domainLimiter != nil {
-				domain := request.URL.Hostname()
-				if err := p.domainLimiter.Acquire(ctx, domain); err != nil {
-					results[idx] = &Result{Error: err}
-					return
-				}
-			}
-
-			// Create job
-			jobs[idx] = worker.NewJob(request.Clone(ctx))
-		}(i, req)
-	}
-
-	wgDomain.Wait()
-
-	// Submit all jobs (skip if domain rate limit failed)
-	var submitErrors int
-	for i, job := range jobs {
-		if results[i] != nil {
-			// Already has error from domain rate limiting
-			submitErrors++
-			continue
-		}
-
-		if err := p.workerPool.Submit(job); err != nil {
-			submitErrors++
+		jobs[i] = worker.NewJob(req.Clone(ctx))
+		if err := p.workerPool.Submit(jobs[i]); err != nil {
 			results[i] = &Result{Error: err}
 		}
 	}

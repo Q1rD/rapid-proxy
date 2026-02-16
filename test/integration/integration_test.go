@@ -490,9 +490,9 @@ func TestIntegration_DomainRateLimiting(t *testing.T) {
 	target := NewMockTarget()
 	defer target.Stop()
 
-	// Create farm
+	// Create farm with 1 proxy to isolate per-proxy domain limiting
 	farm := NewMockProxyFarm(FarmConfig{
-		NumProxies:  10,
+		NumProxies:  1,
 		BaseLatency: 5 * time.Millisecond,
 		FailureRate: 0.0,
 	})
@@ -503,16 +503,16 @@ func TestIntegration_DomainRateLimiting(t *testing.T) {
 	}
 	defer farm.Stop()
 
-	// Create pool with domain rate limiting
+	// Create pool with per-proxy domain rate limiting
 	config := rapidproxy.DefaultConfig()
 	config.ProxyURLs = farm.URLs()
 	config.NumWorkers = 20
 	config.QueueSize = 200
 	config.RateLimitPerProxy = 100 // High proxy limit
 
-	// Configure domain rate limit
+	// Configure per-proxy domain rate limit: 10 RPS per proxy
 	config.DomainRateLimits = map[string]int64{
-		"127.0.0.1": 10, // 10 RPS for localhost
+		"127.0.0.1": 10,
 	}
 
 	pool, err := rapidproxy.New(config)
@@ -521,7 +521,7 @@ func TestIntegration_DomainRateLimiting(t *testing.T) {
 	}
 	defer func() { _ = pool.Close() }()
 
-	// Test: Send burst of requests
+	// Test: Send burst of requests through single proxy
 	const numRequests = 30
 	start := time.Now()
 	successCount := 0
@@ -537,7 +537,7 @@ func TestIntegration_DomainRateLimiting(t *testing.T) {
 	elapsed := time.Since(start)
 	actualRPS := float64(successCount) / elapsed.Seconds()
 
-	t.Logf("Domain rate limiting test: %d/%d requests succeeded in %v (%.1f RPS)",
+	t.Logf("Per-proxy domain rate limiting test: %d/%d requests in %v (%.1f RPS)",
 		successCount, numRequests, elapsed, actualRPS)
 
 	// All requests should eventually succeed (blocking)
@@ -545,10 +545,10 @@ func TestIntegration_DomainRateLimiting(t *testing.T) {
 		t.Errorf("Expected all %d requests to succeed, got %d", numRequests, successCount)
 	}
 
-	// Should be rate limited - expect at least 2 seconds for 30 requests at 10 RPS
-	// First 20 go through (burst = 2x rate), next 10 need 1 second
+	// 1 proxy, 10 RPS, burst=10. 30 requests: first 10 instant, rest throttled
+	// Should take at least 1 second
 	if elapsed < 1*time.Second {
-		t.Errorf("Requests completed too fast (%v), domain rate limiting may not be working", elapsed)
+		t.Errorf("Requests completed too fast (%v), per-proxy domain rate limiting may not be working", elapsed)
 	}
 
 	// Verify target received all requests

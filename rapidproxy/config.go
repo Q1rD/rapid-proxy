@@ -114,20 +114,27 @@ type Config struct {
 	// Start conservative and increase gradually based on monitoring.
 	RateLimitPerProxy int64
 
+	// MaxConcurrentPerProxy is the maximum number of simultaneous in-flight
+	// requests per proxy. When a proxy reaches this limit, the selector skips
+	// it and tries the next one.
+	//
+	// Default: 0 (unlimited)
+	// Also sets MaxConnsPerHost on each proxy's http.Transport.
+	//
+	// Example: 1000 proxies * 2 concurrent = 2000 max total in-flight requests
+	MaxConcurrentPerProxy int
+
 	// DomainRateLimits is optional per-domain rate limiting (map: domain -> RPS).
-	// Limits total requests per second to each target domain across ALL proxies.
+	// Each proxy gets its own domain rate limiter with these limits.
+	// This enforces per-proxy domain RPS (e.g., max 50 RPS to api.mexc.com per proxy).
 	//
 	// Default: nil (no per-domain limits)
-	// Optional: Set to enforce rate limits on specific domains
 	//
 	// Example:
 	//   config.DomainRateLimits = map[string]int64{
-	//       "api.example.com":     100,  // Max 100 RPS to this domain
-	//       "slow-api.example.com": 10,  // Max 10 RPS to this domain
+	//       "api.example.com":     100,  // Max 100 RPS per proxy to this domain
+	//       "slow-api.example.com": 10,  // Max 10 RPS per proxy to this domain
 	//   }
-	//
-	// Note: Both proxy and domain limits are enforced. The effective rate is
-	// limited by whichever is more restrictive.
 	//
 	// Domain matching:
 	//   - Exact match only (no wildcards)
@@ -253,6 +260,10 @@ func (c *Config) Validate() error {
 
 	if c.DegradedThreshold <= 0 || c.DegradedThreshold > 1 {
 		return fmt.Errorf("DegradedThreshold must be between 0 and 1, got %f", c.DegradedThreshold)
+	}
+
+	if c.MaxConcurrentPerProxy < 0 {
+		return fmt.Errorf("MaxConcurrentPerProxy must be non-negative, got %d", c.MaxConcurrentPerProxy)
 	}
 
 	if c.DegradedThreshold >= c.FailureThreshold {

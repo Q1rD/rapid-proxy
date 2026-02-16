@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/Q1rD/rapid-proxy/internal/ratelimit"
 )
 
 // ProxyClient represents a single proxy with singleton HTTP client
@@ -32,6 +34,12 @@ type ProxyClient struct {
 
 	// Circuit breaker (will be set by manager)
 	circuitBreaker CircuitBreaker
+
+	// Concurrency semaphore (nil = unlimited)
+	concurrencySem chan struct{}
+
+	// Per-proxy domain rate limiter (nil = no limits)
+	domainLimiter *ratelimit.DomainLimiter
 }
 
 // State constants
@@ -175,6 +183,45 @@ func (c *ProxyClient) SetCircuitBreaker(breaker CircuitBreaker) {
 // GetCircuitBreaker returns the circuit breaker
 func (c *ProxyClient) GetCircuitBreaker() CircuitBreaker {
 	return c.circuitBreaker
+}
+
+// SetConcurrencySemaphore sets the per-proxy concurrency limiter
+func (c *ProxyClient) SetConcurrencySemaphore(capacity int) {
+	if capacity > 0 {
+		c.concurrencySem = make(chan struct{}, capacity)
+	}
+}
+
+// TryAcquireConcurrency attempts to acquire a concurrency slot (non-blocking).
+// Returns true if acquired or no semaphore configured.
+func (c *ProxyClient) TryAcquireConcurrency() bool {
+	if c.concurrencySem == nil {
+		return true
+	}
+	select {
+	case c.concurrencySem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// ReleaseConcurrency releases a concurrency slot. No-op if no semaphore configured.
+func (c *ProxyClient) ReleaseConcurrency() {
+	if c.concurrencySem == nil {
+		return
+	}
+	<-c.concurrencySem
+}
+
+// SetDomainLimiter sets the per-proxy domain rate limiter
+func (c *ProxyClient) SetDomainLimiter(limiter *ratelimit.DomainLimiter) {
+	c.domainLimiter = limiter
+}
+
+// GetDomainLimiter returns the per-proxy domain rate limiter
+func (c *ProxyClient) GetDomainLimiter() *ratelimit.DomainLimiter {
+	return c.domainLimiter
 }
 
 // GetMetrics returns current metrics snapshot

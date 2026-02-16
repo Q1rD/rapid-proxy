@@ -128,6 +128,23 @@ func (p *Pool) executeJob(job Job) {
 		return
 	}
 
+	// Release concurrency slot when done (acquired by selector)
+	defer proxyClient.ReleaseConcurrency()
+
+	// Per-proxy domain rate limit (blocking with context)
+	if dl := proxyClient.GetDomainLimiter(); dl != nil {
+		domain := job.Request.URL.Hostname()
+		if err := dl.Acquire(job.Context, domain); err != nil {
+			p.failedJobs.Add(1)
+			job.ResultCh <- Result{
+				Error:    err,
+				ProxyURL: proxyClient.ProxyURL(),
+				Duration: time.Since(start),
+			}
+			return
+		}
+	}
+
 	// Step 2: Execute request through proxy
 	resp, err := proxyClient.Do(job.Request)
 	duration := time.Since(start)

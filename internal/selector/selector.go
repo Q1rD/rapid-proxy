@@ -112,14 +112,20 @@ func (s *RoundRobinSelector) Select(ctx context.Context) (*connection.ProxyClien
 			}
 		}
 
-		// Check 2: Rate limit (non-blocking)
+		// Check 2: Concurrency limit (non-blocking, reversible)
+		if !client.TryAcquireConcurrency() {
+			continue // Skip proxy at max concurrent requests
+		}
+
+		// Check 3: Rate limit (non-blocking, consumes token)
 		if client.GetRateLimiter() != nil {
 			if !client.GetRateLimiter().TryAcquire() {
+				client.ReleaseConcurrency() // Undo concurrency acquire
 				continue // Skip rate-limited proxy
 			}
 		}
 
-		// Found available proxy
+		// Found available proxy (concurrency slot held, caller must defer ReleaseConcurrency)
 		s.successSelections.Add(1)
 		return client, nil
 	}
